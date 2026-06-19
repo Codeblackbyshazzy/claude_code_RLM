@@ -1,60 +1,351 @@
 #!/usr/bin/env python3
-"""Persistent mini-REPL for RLM-style workflows in Claude Code.
+"""Persistent REPL for Recursive Language Model (RLM) workflows in Claude Code.
 
-This script provides a *stateful* Python environment across invocations by
-saving a pickle file to disk. It is intentionally small and dependency-free.
+This is a faithful instantiation of *Recursive Language Models* (Zhang, Kraska,
+Khattab; arXiv:2512.24601), Algorithm 1, adapted to Claude Code's primitives.
 
-Typical flow:
-  1) Initialise context:
-       python rlm_repl.py init path/to/context.txt
-  2) Execute code repeatedly (state persists):
-       python rlm_repl.py exec -c 'print(len(content))'
-       python rlm_repl.py exec <<'PYCODE'
-       # you can write multi-line code
-       hits = grep('TODO')
-       print(hits[:3])
-       PYCODE
+Mental model (the paper's three design choices):
+  1. SYMBOLIC HANDLE TO THE PROMPT. The long context P is loaded as a `context`
+     variable inside this REPL. The root model (the main Claude Code conversation)
+     only ever sees *metadata* about it (type, length, a short prefix) plus the
+     *truncated* stdout of code it runs -- never the whole thing. This is what
+     keeps an arbitrarily large prompt out of the root's context window.
+  2. OUTPUT VIA A VARIABLE. The final answer is returned by setting it inside the
+     REPL with FINAL(answer) or FINAL_VAR(varname), not by the root verbalizing it.
+     So the answer can be larger than the root's output window.
+  3. SYMBOLIC RECURSION. Code running *inside* this REPL can invoke the LLM
+     programmatically, in loops, over slices of the context:
+       - llm_query(prompt)      -> a single sub-LM call (a "leaf"; tools OFF).
+       - llm_query_map(prompts) -> many leaf calls, run in parallel (batching).
+       - rlm_query(context,q)   -> a full *recursive* RLM over a sub-context,
+                                   used for sub-tasks too big for one leaf call;
+                                   falls back to llm_query at the max depth.
 
-The script injects these variables into the exec environment:
-  - context: dict with keys {path, loaded_at, content}
-  - content: string alias for context['content']
-  - buffers: list[str] for storing intermediate text results
+The sub-LM is a nested *headless Claude Code* process (`claude -p`), reusing your
+existing login. `llm_query` runs it with tools OFF (a plain LLM call); `rlm_query`
+runs it WITH the rlm skill + bash ON (its own REPL), which is what makes recursion
+"recursive". No Anthropic API key or SDK is involved.
 
-It also injects helpers:
-  - peek(start=0, end=1000) -> str
-  - grep(pattern, max_matches=20, window=120, flags=0) -> list[dict]
-  - chunk_indices(size=200000, overlap=0) -> list[(start,end)]
-  - write_chunks(out_dir, size=200000, overlap=0, prefix='chunk') -> list[str]
-  - add_buffer(text: str) -> None
+Typical flow (driven by the root model via the `rlm` skill):
+  python rlm_repl.py init path/to/context.txt        # load P, print metadata
+  python rlm_repl.py status                           # inspect state
+  python rlm_repl.py exec -c "print(peek(0, 2000))"   # probe
+  python rlm_repl.py exec <<'PY'                       # decompose + sub-query
+  lines = [ln for ln in content.splitlines() if ln.strip()]
+  prompts = [build_prompt(batch) for batch in chunked(lines, 50)]
+  outs = llm_query_map(prompts)        # parallel sub-LM calls
+  ...aggregate into a variable...
+  FINAL_VAR("answer")
+  PY
+  python rlm_repl.py final                             # print the final answer
 
-Security note:
-  This runs arbitrary Python via exec. Treat it like running code you wrote.
+State persists between invocations via a pickle file. Helpers and the context are
+re-injected each `exec`; only your own (pickleable) variables are carried over.
+
+Security note: `exec` runs arbitrary Python you wrote, and `llm_query`/`rlm_query`
+spawn `claude -p` subprocesses. Treat it like running code you wrote.
 """
 
 from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import pickle
 import re
+import shutil
+import subprocess
 import sys
 import textwrap
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 DEFAULT_STATE_PATH = Path(".claude/rlm_state/state.pkl")
 DEFAULT_MAX_OUTPUT_CHARS = 8000
+
+# Sub-LM defaults. Override per-call or via environment.
+#   RLM_SUB_MODEL   : model alias for llm_query leaf calls (default: haiku -- cheap,
+#                     200K-token window, strong at extraction/classification).
+#   RLM_MAX_WORKERS : parallel sub-LM calls for llm_query_map (default: 8).
+#   RLM_DEPTH       : current recursion depth (managed automatically; 0 at the root).
+#   RLM_MAX_DEPTH   : max recursion depth for rlm_query (default: 1). At the limit,
+#                     rlm_query degrades to a single llm_query call (paper behavior).
+DEFAULT_SUB_MODEL = os.environ.get("RLM_SUB_MODEL", "haiku")
+DEFAULT_MAX_WORKERS = int(os.environ.get("RLM_MAX_WORKERS", "8"))
+DEFAULT_RLM_MODEL = os.environ.get("RLM_ROOT_MODEL", "sonnet")
+RLM_CLAUDE_DISALLOWED_TOOLS = (
+    "WebSearch WebFetch Monitor "
+    "ScheduleWakeup Task AskUserQuestion "
+    "CronCreate CronDelete CronList "
+    "RemoteTrigger PushNotification Workflow "
+    "TaskCreate TaskGet TaskList TaskOutput TaskStop TaskUpdate "
+    "EnterPlanMode ExitPlanMode EnterWorktree ExitWorktree"
+)
+
+# A minimal system nudge so leaf outputs are clean and machine-parseable. The
+# paper's llm_query is a plain call; this only trims preambles so that code which
+# aggregates the outputs (e.g. parsing "N: label" lines) is not derailed by chatter.
+DEFAULT_LEAF_SYSTEM = (
+    "You are a sub-LLM invoked programmatically inside a larger system. "
+    "Answer the query precisely using only the provided text. "
+    "Output only the answer in the exact format requested, with no preamble, "
+    "explanation, or markdown fences unless explicitly asked."
+)
 
 
 class RlmReplError(RuntimeError):
     pass
 
 
+# --------------------------------------------------------------------------- #
+# Sub-LM calls (the "recursion" in Recursive Language Models)                  #
+# --------------------------------------------------------------------------- #
+def _claude_exe() -> str:
+    exe = shutil.which("claude")
+    if not exe:
+        raise RlmReplError(
+            "`claude` CLI not found on PATH. llm_query/rlm_query need the Claude "
+            "Code CLI to spawn the sub-LM."
+        )
+    return exe
+
+
+# --- Leaf-usage accounting (opt-in; off by default) ------------------------- #
+# Each llm_query shells out to its own `claude -p` subprocess, so its token/cost
+# usage is NOT visible in the root session's usage JSON. For evaluation we need to
+# account for it. When the environment variable RLM_LEAF_USAGE_LOG points at a
+# file, llm_query adds `--output-format json` to the leaf call, returns the same
+# `result` text the plain call would have produced (so callers are unaffected),
+# and appends one JSON record of that leaf's usage to the log. When the variable
+# is unset, llm_query runs EXACTLY as before (plain text, no JSON) -- so the skill
+# the user actually gets is unchanged; this is purely measurement instrumentation.
+_LEAF_USAGE_LOCK = threading.Lock()
+_LEAF_TOKEN_KEYS = (
+    "input_tokens", "output_tokens",
+    "cache_creation_input_tokens", "cache_read_input_tokens",
+)
+
+
+def _leaf_usage_log_path() -> Optional[str]:
+    p = os.environ.get("RLM_LEAF_USAGE_LOG", "").strip()
+    return p or None
+
+
+def _record_leaf_usage(log_path: str, model: str, obj: Optional[Dict[str, Any]],
+                       ok: bool, note: str = "") -> None:
+    """Append one leaf-call usage record (thread-safe) to log_path as JSONL."""
+    usage = (obj or {}).get("usage") if isinstance(obj, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    rec: Dict[str, Any] = {"ts": time.time(), "model": model, "ok": bool(ok)}
+    total = 0
+    for k in _LEAF_TOKEN_KEYS:
+        v = usage.get(k, 0)
+        v = int(v) if isinstance(v, (int, float)) else 0
+        rec[k] = v
+        total += v
+    rec["total_tokens"] = total
+    cost = (obj or {}).get("total_cost_usd") if isinstance(obj, dict) else None
+    rec["cost_usd"] = float(cost) if isinstance(cost, (int, float)) else 0.0
+    if note:
+        rec["note"] = note
+    line = json.dumps(rec)
+    try:
+        with _LEAF_USAGE_LOCK:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:  # never let accounting break a run
+        pass
+
+
+def llm_query(
+    prompt: str,
+    model: Optional[str] = None,
+    timeout: int = 300,
+    system: Optional[str] = DEFAULT_LEAF_SYSTEM,
+) -> str:
+    """A single sub-LM call -- the leaf of the recursion.
+
+    Runs a headless Claude Code (`claude -p`) with TOOLS OFF, so it behaves as a
+    plain LLM forward pass: it reads the (bounded) `prompt` in its own context
+    window and returns a string. The root is responsible for chunking the context
+    down to something a leaf can hold; the leaf does the *semantic* work
+    (classify / extract / summarize / answer) while the root's Python does the
+    *arithmetic* (count / aggregate / format).
+
+    Returns the sub-LM's text. On failure returns a "[llm_query: ...]" marker
+    string rather than raising, so a large loop is not aborted by one bad call.
+
+    Usage accounting: if RLM_LEAF_USAGE_LOG is set, the call is made with
+    `--output-format json` and its usage/cost is appended to that log; the text
+    returned is identical to the un-instrumented path.
+    """
+    model = model or DEFAULT_SUB_MODEL
+    usage_log = _leaf_usage_log_path()
+    cmd = [_claude_exe(), "-p", "--model", model, "--allowedTools", ""]
+    if usage_log:
+        cmd += ["--output-format", "json"]
+    if system:
+        cmd += ["--append-system-prompt", system]
+    try:
+        res = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        if usage_log:
+            _record_leaf_usage(usage_log, model, None, ok=False, note=f"TIMEOUT/{timeout}s")
+        return f"[llm_query: TIMEOUT after {timeout}s]"
+    except Exception as e:  # pragma: no cover - environment dependent
+        if usage_log:
+            _record_leaf_usage(usage_log, model, None, ok=False, note=f"{type(e).__name__}")
+        return f"[llm_query: ERROR {type(e).__name__}: {e}]"
+
+    raw = (res.stdout or "").strip()
+    if not usage_log:
+        # Default path: byte-identical to the original (plain text, no JSON).
+        if res.returncode != 0 and not raw:
+            err = (res.stderr or "").strip()[:300]
+            return f"[llm_query: ERROR rc={res.returncode}] {err}"
+        return raw
+
+    # Instrumented path: parse the JSON envelope, record usage, return result text.
+    try:
+        d = json.loads(raw)
+    except Exception:
+        _record_leaf_usage(usage_log, model, None, ok=False, note="jsonparse")
+        if res.returncode != 0 and not raw:
+            err = (res.stderr or "").strip()[:300]
+            return f"[llm_query: ERROR rc={res.returncode}] {err}"
+        return raw
+    ok = not bool(d.get("is_error"))
+    _record_leaf_usage(usage_log, model, d, ok=ok)
+    out = (d.get("result") or "").strip()
+    if not ok and not out:
+        return f"[llm_query: ERROR is_error] {(d.get('result') or '')[:200]}"
+    return out
+
+
+def llm_query_map(
+    prompts: List[str],
+    model: Optional[str] = None,
+    max_workers: Optional[int] = None,
+    timeout: int = 300,
+    system: Optional[str] = DEFAULT_LEAF_SYSTEM,
+) -> List[str]:
+    """Run many llm_query leaf calls in parallel; return outputs in input order.
+
+    This is the workhorse for information-dense tasks: batch the context into N
+    chunks, build one prompt per chunk, and fan them out. Prefer fewer, fatter
+    batches (a leaf can hold a large chunk) over thousands of per-item calls.
+    Results preserve the order of `prompts`.
+    """
+    model = model or DEFAULT_SUB_MODEL
+    workers = max_workers or DEFAULT_MAX_WORKERS
+    workers = max(1, min(workers, len(prompts) or 1))
+    results: List[Optional[str]] = [None] * len(prompts)
+
+    def _one(i_p: Tuple[int, str]) -> Tuple[int, str]:
+        i, p = i_p
+        return i, llm_query(p, model=model, timeout=timeout, system=system)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for i, out in ex.map(_one, list(enumerate(prompts))):
+            results[i] = out
+    return [r if r is not None else "" for r in results]
+
+
+def rlm_query(
+    context_text: str,
+    query: str,
+    model: Optional[str] = None,
+    timeout: int = 1200,
+    state_path: Optional[str] = None,
+) -> str:
+    """A full RECURSIVE RLM over a sub-context -- the depth>1 primitive.
+
+    Use this when a sub-task is itself too large/complex for a single llm_query
+    (e.g. "analyze these 500 documents that each need their own chunking"). It
+    spawns a nested headless Claude Code WITH bash + the rlm skill, so the sub-task
+    gets its own REPL, its own llm_query leaves, and its own iterative loop.
+
+    Depth guard: a child RLM would run at depth+1. If that child depth is at or
+    beyond RLM_MAX_DEPTH, degrade to a single llm_query call. max_depth=1 (the
+    default) therefore means "llm_query leaves only"; max_depth=2 allows the
+    root to spawn one nested RLM level, whose own recursive calls fall back to
+    leaf llm_query calls.
+    """
+    depth = int(os.environ.get("RLM_DEPTH", "0"))
+    max_depth = int(os.environ.get("RLM_MAX_DEPTH", "1"))
+    child_depth = depth + 1
+    if child_depth >= max_depth:
+        return llm_query(
+            f"{query}\n\n--- CONTEXT ---\n{context_text}",
+            timeout=min(timeout, 300),
+        )
+
+    model = model or DEFAULT_RLM_MODEL
+    run_id = f"d{child_depth}_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+    sub_state = Path(state_path) if state_path else Path(f".claude/rlm_state/sub_{run_id}.pkl")
+    sub_ctx = sub_state.with_suffix(".context.txt")
+    sub_ctx.parent.mkdir(parents=True, exist_ok=True)
+    sub_ctx.write_text(context_text, encoding="utf-8")
+
+    repl = str(Path(__file__).resolve())
+    prompt = textwrap.dedent(
+        f"""\
+        Use the rlm skill to answer a query over a large context file.
+
+        The context is already on disk at: {sub_ctx}
+        The rlm REPL script is at: {repl}
+        Use this isolated REPL state file for every REPL command: {sub_state}
+
+        Start with exactly:
+        python "{repl}" --state "{sub_state}" init "{sub_ctx}"
+
+        Initialise the REPL on that file and follow the rlm skill procedure
+        (probe -> decompose -> programmatic llm_query over chunks -> aggregate),
+        passing --state "{sub_state}" to every exec/final command. Then set the
+        final answer with FINAL(...) or FINAL_VAR(...). Reply with ONLY the final
+        answer text.
+
+        query = {query!r}
+        """
+    )
+    env = dict(os.environ)
+    env["RLM_DEPTH"] = str(child_depth)
+    cmd = [
+        _claude_exe(), "-p", "--model", model,
+        "--allowedTools", "Bash Read Write Edit Grep Glob Skill",
+        "--disallowedTools", RLM_CLAUDE_DISALLOWED_TOOLS,
+    ]
+    try:
+        res = subprocess.run(
+            cmd, input=prompt, capture_output=True, text=True,
+            timeout=timeout, encoding="utf-8", errors="replace", env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return f"[rlm_query: TIMEOUT after {timeout}s]"
+    out = (res.stdout or "").strip()
+    if res.returncode != 0 and not out:
+        return f"[rlm_query: ERROR rc={res.returncode}] {(res.stderr or '')[:300]}"
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# State persistence                                                           #
+# --------------------------------------------------------------------------- #
 def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -79,16 +370,14 @@ def _save_state(state: Dict[str, Any], state_path: Path) -> None:
     tmp_path.replace(state_path)
 
 
-def _read_text_file(path: Path, max_bytes: int | None = None) -> str:
+def _read_text_file(path: Path, max_bytes: Optional[int] = None) -> str:
     if not path.exists():
         raise RlmReplError(f"Context file does not exist: {path}")
-    data: bytes
     with path.open("rb") as f:
         data = f.read() if max_bytes is None else f.read(max_bytes)
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
-        # Fall back to a lossy decode that will not crash.
         return data.decode("utf-8", errors="replace")
 
 
@@ -97,7 +386,8 @@ def _truncate(s: str, max_chars: int) -> str:
         return ""
     if len(s) <= max_chars:
         return s
-    return s[:max_chars] + f"\n... [truncated to {max_chars} chars] ...\n"
+    head = s[:max_chars]
+    return head + f"\n... [stdout truncated: {len(s):,} chars total, showing {max_chars:,}] ...\n"
 
 
 def _is_pickleable(value: Any) -> bool:
@@ -119,44 +409,46 @@ def _filter_pickleable(d: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     return kept, dropped
 
 
-def _make_helpers(context_ref: Dict[str, Any], buffers_ref: List[str]):
-    # These close over context_ref/buffers_ref so changes persist.
-    def peek(start: int = 0, end: int = 1000) -> str:
-        content = context_ref.get("content", "")
-        return content[start:end]
+# --------------------------------------------------------------------------- #
+# Context-manipulation helpers (closures over the live content string)        #
+# --------------------------------------------------------------------------- #
+def _make_helpers(state: Dict[str, Any], buffers_ref: List[str], final_ref: Dict[str, Any]):
+    def _content() -> str:
+        return state.get("content", "")
 
-    def grep(
-        pattern: str,
-        max_matches: int = 20,
-        window: int = 120,
-        flags: int = 0,
-    ) -> List[Dict[str, Any]]:
-        content = context_ref.get("content", "")
+    def peek(start: int = 0, end: int = 1000) -> str:
+        """Return content[start:end] -- a window into the raw context."""
+        return _content()[start:end]
+
+    def grep(pattern: str, max_matches: int = 20, window: int = 120, flags: int = 0):
+        """Regex-search the context; return [{match, span, snippet}] with context windows."""
+        content = _content()
         out: List[Dict[str, Any]] = []
         for m in re.finditer(pattern, content, flags):
-            start, end = m.span()
-            snippet_start = max(0, start - window)
-            snippet_end = min(len(content), end + window)
-            out.append(
-                {
-                    "match": m.group(0),
-                    "span": (start, end),
-                    "snippet": content[snippet_start:snippet_end],
-                }
-            )
+            s, e = m.span()
+            out.append({
+                "match": m.group(0),
+                "span": (s, e),
+                "snippet": content[max(0, s - window): min(len(content), e + window)],
+            })
             if len(out) >= max_matches:
                 break
         return out
 
-    def chunk_indices(size: int = 200_000, overlap: int = 0) -> List[Tuple[int, int]]:
+    def chunked(seq, size: int):
+        """Yield successive `size`-length slices of any sequence (list of lines, etc.)."""
         if size <= 0:
             raise ValueError("size must be > 0")
-        if overlap < 0:
-            raise ValueError("overlap must be >= 0")
-        if overlap >= size:
-            raise ValueError("overlap must be < size")
+        for i in range(0, len(seq), size):
+            yield seq[i:i + size]
 
-        content = context_ref.get("content", "")
+    def chunk_indices(size: int = 200_000, overlap: int = 0) -> List[Tuple[int, int]]:
+        """Character (start, end) spans tiling the context, with optional overlap."""
+        if size <= 0:
+            raise ValueError("size must be > 0")
+        if not (0 <= overlap < size):
+            raise ValueError("overlap must satisfy 0 <= overlap < size")
+        content = _content()
         n = len(content)
         spans: List[Tuple[int, int]] = []
         step = size - overlap
@@ -167,75 +459,118 @@ def _make_helpers(context_ref: Dict[str, Any], buffers_ref: List[str]):
                 break
         return spans
 
-    def write_chunks(
-        out_dir: str | os.PathLike,
-        size: int = 200_000,
-        overlap: int = 0,
-        prefix: str = "chunk",
-        encoding: str = "utf-8",
-    ) -> List[str]:
-        content = context_ref.get("content", "")
-        spans = chunk_indices(size=size, overlap=overlap)
+    def write_chunks(out_dir, size: int = 200_000, overlap: int = 0,
+                     prefix: str = "chunk", encoding: str = "utf-8") -> List[str]:
+        """Materialise character chunks as files (useful for rlm_query/inspection)."""
+        content = _content()
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         paths: List[str] = []
-        for i, (s, e) in enumerate(spans):
+        for i, (s, e) in enumerate(chunk_indices(size=size, overlap=overlap)):
             p = out_path / f"{prefix}_{i:04d}.txt"
             p.write_text(content[s:e], encoding=encoding)
             paths.append(str(p))
         return paths
 
     def add_buffer(text: str) -> None:
+        """Append a string to the persistent `buffers` list (intermediate results)."""
         buffers_ref.append(str(text))
+
+    def FINAL(answer: Any) -> None:
+        """Set the final answer directly. Stops the loop; this value is returned."""
+        final_ref["value"] = "" if answer is None else str(answer)
+
+    def FINAL_VAR(name: str) -> None:
+        """Set the final answer from a REPL variable you created (by name)."""
+        frame = sys._getframe(1)
+        if name in frame.f_locals:
+            val = frame.f_locals[name]
+        elif name in frame.f_globals:
+            val = frame.f_globals[name]
+        else:
+            raise NameError(f"FINAL_VAR: variable {name!r} is not defined in the REPL")
+        final_ref["value"] = "" if val is None else str(val)
 
     return {
         "peek": peek,
         "grep": grep,
+        "chunked": chunked,
         "chunk_indices": chunk_indices,
         "write_chunks": write_chunks,
         "add_buffer": add_buffer,
+        "llm_query": llm_query,
+        "llm_query_map": llm_query_map,
+        "rlm_query": rlm_query,
+        "FINAL": FINAL,
+        "FINAL_VAR": FINAL_VAR,
     }
 
 
+# --------------------------------------------------------------------------- #
+# Metadata (the constant-size view the root model gets of the context)        #
+# --------------------------------------------------------------------------- #
+def _metadata_str(state: Dict[str, Any]) -> str:
+    content = state.get("content", "")
+    n = len(content)
+    lines = content.count("\n") + 1 if content else 0
+    prefix = content[:600].replace("\r", "")
+    final_set = "value" in state.get("final", {}) if isinstance(state.get("final"), dict) else bool(state.get("final"))
+    return textwrap.dedent(
+        f"""\
+        RLM REPL initialised.
+          context : str  ({n:,} chars, ~{lines:,} lines, ~{n // 4:,} tokens est.)
+          source  : {state.get('context_path')}
+          buffers : {len(state.get('buffers', []))}
+          final   : {'SET' if final_set else 'not set'}
+
+        The full context is the `context` variable in the REPL (also aliased `content`).
+        You can see only metadata + truncated stdout -- never the whole context. Use
+        llm_query / llm_query_map to do semantic work over chunks of it.
+
+        --- first {len(prefix)} chars of context ---
+        {prefix}
+        --- end preview ---"""
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Commands                                                                    #
+# --------------------------------------------------------------------------- #
 def cmd_init(args: argparse.Namespace) -> int:
     state_path = Path(args.state)
     ctx_path = Path(args.context)
-
     content = _read_text_file(ctx_path, max_bytes=args.max_bytes)
     state: Dict[str, Any] = {
-        "version": 1,
-        "context": {
-            "path": str(ctx_path),
-            "loaded_at": time.time(),
-            "content": content,
-        },
+        "version": 2,
+        "context_path": str(ctx_path),
+        "loaded_at": time.time(),
+        "content": content,
         "buffers": [],
+        "final": {},
         "globals": {},
     }
     _save_state(state, state_path)
-
-    print(f"Initialised RLM REPL state at: {state_path}")
-    print(f"Loaded context: {ctx_path} ({len(content):,} chars)")
+    print(_metadata_str(state))
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     state = _load_state(Path(args.state))
-    ctx = state.get("context", {})
-    content = ctx.get("content", "")
-    buffers = state.get("buffers", [])
+    print(_metadata_str(state))
     g = state.get("globals", {})
-
-    print("RLM REPL status")
-    print(f"  State file: {args.state}")
-    print(f"  Context path: {ctx.get('path')}")
-    print(f"  Context chars: {len(content):,}")
-    print(f"  Buffers: {len(buffers)}")
-    print(f"  Persisted vars: {len(g)}")
-    if args.show_vars and g:
-        for k in sorted(g.keys()):
-            print(f"    - {k}")
+    if g:
+        print(f"\n  persisted vars ({len(g)}): " + ", ".join(sorted(g.keys())))
     return 0
+
+
+def cmd_final(args: argparse.Namespace) -> int:
+    state = _load_state(Path(args.state))
+    final = state.get("final", {})
+    if isinstance(final, dict) and "value" in final:
+        print(final["value"])
+        return 0
+    sys.stderr.write("No final answer set yet (use FINAL(...) or FINAL_VAR(...) in exec).\n")
+    return 1
 
 
 def cmd_reset(args: argparse.Namespace) -> int:
@@ -261,65 +596,47 @@ def cmd_export_buffers(args: argparse.Namespace) -> int:
 def cmd_exec(args: argparse.Namespace) -> int:
     state_path = Path(args.state)
     state = _load_state(state_path)
-
-    ctx = state.get("context")
-    if not isinstance(ctx, dict) or "content" not in ctx:
-        raise RlmReplError("State is missing a valid 'context'. Re-run init.")
+    if "content" not in state:
+        raise RlmReplError("State is missing 'content'. Re-run init.")
 
     buffers = state.setdefault("buffers", [])
     if not isinstance(buffers, list):
         buffers = []
         state["buffers"] = buffers
-
+    final_ref: Dict[str, Any] = state.setdefault("final", {})
+    if not isinstance(final_ref, dict):
+        final_ref = {}
+        state["final"] = final_ref
     persisted = state.setdefault("globals", {})
     if not isinstance(persisted, dict):
         persisted = {}
         state["globals"] = persisted
 
-    code = args.code
-    if code is None:
-        code = sys.stdin.read()
+    code = args.code if args.code is not None else sys.stdin.read()
 
-    # Build execution environment.
-    # Start from persisted variables, then inject context, buffers and helpers.
+    # Build the execution environment: persisted user vars, then the live context
+    # and helpers. `context` and `content` both point at the loaded string.
     env: Dict[str, Any] = dict(persisted)
-    env["context"] = ctx
-    env["content"] = ctx.get("content", "")
+    env["context"] = state["content"]
+    env["content"] = state["content"]
     env["buffers"] = buffers
-
-    helpers = _make_helpers(ctx, buffers)
+    helpers = _make_helpers(state, buffers, final_ref)
     env.update(helpers)
 
-    # Capture output.
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
-
+    stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
     try:
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
             exec(code, env, env)
     except Exception:
         traceback.print_exc(file=stderr_buf)
 
-    # Pull back possibly mutated context/buffers.
-    maybe_ctx = env.get("context")
-    if isinstance(maybe_ctx, dict) and "content" in maybe_ctx:
-        state["context"] = maybe_ctx
-        ctx = maybe_ctx
+    # Pull back mutated buffers.
+    if isinstance(env.get("buffers"), list):
+        state["buffers"] = env["buffers"]
 
-    maybe_buffers = env.get("buffers")
-    if isinstance(maybe_buffers, list):
-        state["buffers"] = maybe_buffers
-        buffers = maybe_buffers
-
-    # Persist any new variables, excluding injected keys.
-    injected_keys = {
-        "__builtins__",
-        "context",
-        "content",
-        "buffers",
-        *helpers.keys(),
-    }
-    to_persist = {k: v for k, v in env.items() if k not in injected_keys}
+    # Persist user variables (exclude injected names and the big context aliases).
+    injected = {"__builtins__", "context", "content", "buffers", *helpers.keys()}
+    to_persist = {k: v for k, v in env.items() if k not in injected}
     filtered, dropped = _filter_pickleable(to_persist)
     state["globals"] = filtered
 
@@ -327,17 +644,15 @@ def cmd_exec(args: argparse.Namespace) -> int:
 
     out = stdout_buf.getvalue()
     err = stderr_buf.getvalue()
-
+    if "value" in final_ref:
+        out += (f"\n=== FINAL ANSWER SET ({len(final_ref['value']):,} chars) ===\n"
+                + _truncate(final_ref["value"], args.max_output_chars))
     if dropped and args.warn_unpickleable:
-        msg = "Dropped unpickleable variables: " + ", ".join(dropped)
-        err = (err + ("\n" if err else "") + msg + "\n")
-
+        err += ("\n" if err else "") + "Dropped unpickleable variables: " + ", ".join(dropped) + "\n"
     if out:
         sys.stdout.write(_truncate(out, args.max_output_chars))
-
     if err:
         sys.stderr.write(_truncate(err, args.max_output_chars))
-
     return 0
 
 
@@ -347,78 +662,56 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent(
             """\
-            Persistent mini-REPL for RLM-style workflows.
+            Persistent REPL for Recursive Language Model (RLM) workflows.
 
             Examples:
               python rlm_repl.py init context.txt
               python rlm_repl.py status
-              python rlm_repl.py exec -c "print(len(content))"
+              python rlm_repl.py exec -c "print(peek(0, 2000))"
               python rlm_repl.py exec <<'PY'
-              print(peek(0, 2000))
+              labels = llm_query_map([build(b) for b in chunked(lines, 50)])
+              FINAL_VAR("answer")
               PY
+              python rlm_repl.py final
             """
         ),
     )
-    p.add_argument(
-        "--state",
-        default=str(DEFAULT_STATE_PATH),
-        help=f"Path to state pickle (default: {DEFAULT_STATE_PATH})",
-    )
-
+    p.add_argument("--state", default=str(DEFAULT_STATE_PATH),
+                   help=f"Path to state pickle (default: {DEFAULT_STATE_PATH})")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_init = sub.add_parser("init", help="Initialise state from a context file")
+    p_init = sub.add_parser("init", help="Load a context file and print metadata")
     p_init.add_argument("context", help="Path to the context file")
-    p_init.add_argument(
-        "--max-bytes",
-        type=int,
-        default=None,
-        help="Optional cap on bytes read from the context file",
-    )
+    p_init.add_argument("--max-bytes", type=int, default=None,
+                        help="Optional cap on bytes read from the context file")
     p_init.set_defaults(func=cmd_init)
 
-    p_status = sub.add_parser("status", help="Show current state summary")
-    p_status.add_argument(
-        "--show-vars", action="store_true", help="List persisted variable names"
-    )
+    p_status = sub.add_parser("status", help="Show metadata + persisted var names")
     p_status.set_defaults(func=cmd_status)
+
+    p_final = sub.add_parser("final", help="Print the stored final answer (if set)")
+    p_final.set_defaults(func=cmd_final)
 
     p_reset = sub.add_parser("reset", help="Delete the current state file")
     p_reset.set_defaults(func=cmd_reset)
 
-    p_export = sub.add_parser(
-        "export-buffers", help="Export buffers list to a text file"
-    )
+    p_export = sub.add_parser("export-buffers", help="Export buffers list to a text file")
     p_export.add_argument("out", help="Output file path")
     p_export.set_defaults(func=cmd_export_buffers)
 
-    p_exec = sub.add_parser("exec", help="Execute Python code with persisted state")
-    p_exec.add_argument(
-        "-c",
-        "--code",
-        default=None,
-        help="Inline code string. If omitted, reads code from stdin.",
-    )
-    p_exec.add_argument(
-        "--max-output-chars",
-        type=int,
-        default=DEFAULT_MAX_OUTPUT_CHARS,
-        help=f"Truncate stdout/stderr to this many characters (default: {DEFAULT_MAX_OUTPUT_CHARS})",
-    )
-    p_exec.add_argument(
-        "--warn-unpickleable",
-        action="store_true",
-        help="Warn on stderr when variables could not be persisted",
-    )
+    p_exec = sub.add_parser("exec", help="Execute Python with persisted state + helpers")
+    p_exec.add_argument("-c", "--code", default=None,
+                        help="Inline code. If omitted, reads code from stdin.")
+    p_exec.add_argument("--max-output-chars", type=int, default=DEFAULT_MAX_OUTPUT_CHARS,
+                        help=f"Truncate stdout/stderr to N chars (default: {DEFAULT_MAX_OUTPUT_CHARS})")
+    p_exec.add_argument("--warn-unpickleable", action="store_true",
+                        help="Warn on stderr when variables could not be persisted")
     p_exec.set_defaults(func=cmd_exec)
-
     return p
 
 
 def main(argv: List[str]) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
+    args = build_parser().parse_args(argv)
     try:
         return int(args.func(args))
     except RlmReplError as e:
